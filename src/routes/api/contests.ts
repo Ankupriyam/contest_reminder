@@ -33,6 +33,7 @@ export const Route = createFileRoute("/api/contests")({
             const calendarEvents = await CalendarEvent.find({
               userId: user._id,
               contestId: { $in: contests.map((c) => c.contestId) },
+              status: { $in: ["synced", "updated"] },
             });
 
             const syncedIds = new Set(calendarEvents.map((e) => e.contestId));

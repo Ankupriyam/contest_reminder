@@ -5,9 +5,10 @@ const calendarEventSchema = new Schema(
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     contestId: { type: String, required: true, index: true },
     googleEventId: { type: String, required: true },
+    pendingSince: { type: Date, default: null },
     status: {
       type: String,
-      enum: ["synced", "updated", "failed", "pending"],
+      enum: ["synced", "updated", "failed", "pending", "disabled"],
       default: "synced",
     },
   },

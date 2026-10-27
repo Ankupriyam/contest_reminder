@@ -8,6 +8,7 @@ import { logger } from "./logger";
 import { CalendarEvent } from "@/models/CalendarEvent";
 import { Contest } from "@/models/Contest";
 import { User, type UserDocument } from "@/models/User";
+import { isPendingReservationStale } from "./sync-state";
 import type { Platform } from "@/types";
 
 export interface SyncResult {
@@ -17,10 +18,12 @@ export interface SyncResult {
   failed: number;
 }
 
+const PENDING_RESERVATION_TIMEOUT_MS = 30 * 60_000;
+
 async function createCalendarEventsForPlatforms(
   user: UserDocument,
   platforms: Platform[],
-): Promise<Pick<SyncResult, "synced" | "failed">> {
+): Promise<Pick<SyncResult, "synced" | "removed" | "failed">> {
   const now = new Date();
   const contests = await Contest.find({
     platform: { $in: platforms },
@@ -29,27 +32,108 @@ async function createCalendarEventsForPlatforms(
 
   const results = await Promise.allSettled(
     contests.map(async (contest) => {
+      const reservationTime = new Date();
       const existing = await CalendarEvent.findOne({
         userId: user._id,
         contestId: contest.contestId,
       });
-      if (existing) return "skipped" as const;
+      let reservation: NonNullable<typeof existing> | null = null;
+      if (existing) {
+        if (existing.status === "pending") {
+          if (
+            !isPendingReservationStale(
+              existing.pendingSince,
+              reservationTime,
+              PENDING_RESERVATION_TIMEOUT_MS,
+            )
+          ) {
+            return "skipped" as const;
+          }
+          reservation = await CalendarEvent.findOneAndUpdate(
+            {
+              _id: existing._id,
+              status: "pending",
+              pendingSince: existing.pendingSince ?? null,
+            },
+            { $set: { pendingSince: reservationTime } },
+            { returnDocument: "after" },
+          );
+        } else if (existing.status === "disabled" || existing.status === "failed") {
+          reservation = await CalendarEvent.findOneAndUpdate(
+            { _id: existing._id, status: existing.status },
+            { $set: { status: "pending", pendingSince: reservationTime } },
+            { returnDocument: "after" },
+          );
+        } else {
+          return "skipped" as const;
+        }
+        if (!reservation) return "skipped" as const;
+      } else {
+        try {
+          reservation = await CalendarEvent.create({
+            userId: user._id,
+            contestId: contest.contestId,
+            googleEventId: "pending",
+            pendingSince: reservationTime,
+            status: "pending",
+          });
+        } catch (error) {
+          if (
+            typeof error === "object" &&
+            error !== null &&
+            "code" in error &&
+            error.code === 11000
+          ) {
+            return "skipped" as const;
+          }
+          throw error;
+        }
+      }
 
-      const googleEventId = await createCalendarEvent(user, contest);
-      await CalendarEvent.create({
-        userId: user._id,
-        contestId: contest.contestId,
-        googleEventId,
-        status: "synced",
-      });
+      let googleEventId: string | undefined;
+      try {
+        googleEventId = await createCalendarEvent(user, contest);
+        reservation.googleEventId = googleEventId;
+        reservation.status = "synced";
+        reservation.pendingSince = null;
+        await reservation.save();
+      } catch (error) {
+        if (googleEventId) {
+          try {
+            await deleteCalendarEvent(user, googleEventId);
+          } catch {
+            reservation.googleEventId = googleEventId;
+            reservation.status = "synced";
+            reservation.pendingSince = null;
+            await reservation.save();
+            throw error;
+          }
+        }
+        reservation.status = "disabled";
+        reservation.pendingSince = null;
+        await reservation.save();
+        throw error;
+      }
       return "synced" as const;
     }),
   );
 
-  const synced = results.filter((r) => r.status === "fulfilled" && r.value === "synced").length;
-  const failed = results.filter((r) => r.status === "rejected").length;
+  let synced = results.filter((r) => r.status === "fulfilled" && r.value === "synced").length;
+  let failed = results.filter((r) => r.status === "rejected").length;
+  let removed = 0;
 
-  return { synced, failed };
+  const currentUser = await User.findById(user._id).select("selectedPlatforms");
+  const disabledPlatforms = platforms.filter(
+    (platform) => !currentUser?.selectedPlatforms.includes(platform),
+  );
+  if (disabledPlatforms.length > 0) {
+    const cleanup = await removeCalendarEventsForPlatforms(user, disabledPlatforms);
+    removed = cleanup.removed;
+    failed += cleanup.failed;
+    synced = Math.max(0, synced - removed);
+  }
+
+  return { synced, removed, failed };
 }
 
 async function removeCalendarEventsForPlatforms(
@@ -57,7 +141,10 @@ async function removeCalendarEventsForPlatforms(
   platforms: Platform[],
 ): Promise<Pick<SyncResult, "removed" | "failed">> {
   const now = new Date();
-  const calendarEvents = await CalendarEvent.find({ userId: user._id });
+  const calendarEvents = await CalendarEvent.find({
+    userId: user._id,
+    status: { $in: ["synced", "updated"] },
+  });
   if (calendarEvents.length === 0) {
     return { removed: 0, failed: 0 };
   }
@@ -74,7 +161,9 @@ async function removeCalendarEventsForPlatforms(
   const results = await Promise.allSettled(
     eventsToRemove.map(async (entry) => {
       await deleteCalendarEvent(user, entry.googleEventId);
-      await CalendarEvent.deleteOne({ _id: entry._id });
+      entry.status = "disabled";
+      entry.pendingSince = null;
+      await entry.save();
       return "removed" as const;
     }),
   );
@@ -89,7 +178,10 @@ async function cleanupCalendarEvents(
   user: UserDocument,
 ): Promise<Pick<SyncResult, "removed" | "failed">> {
   const now = new Date();
-  const calendarEvents = await CalendarEvent.find({ userId: user._id });
+  const calendarEvents = await CalendarEvent.find({
+    userId: user._id,
+    status: { $in: ["synced", "updated"] },
+  });
   if (calendarEvents.length === 0) {
     return { removed: 0, failed: 0 };
   }
@@ -101,17 +193,15 @@ async function cleanupCalendarEvents(
   });
   const futureContestIds = new Set(futureContests.map((c) => c.contestId));
 
-  // Any event that doesn't correspond to a future contest gets removed
+  // Cancel stale calendar events but retain their database records for reuse.
   const eventsToRemove = calendarEvents.filter((e) => !futureContestIds.has(e.contestId));
 
   const results = await Promise.allSettled(
     eventsToRemove.map(async (entry) => {
-      try {
-        await deleteCalendarEvent(user, entry.googleEventId);
-      } catch (err) {
-        // Ignore errors if already deleted externally
-      }
-      await CalendarEvent.deleteOne({ _id: entry._id });
+      await deleteCalendarEvent(user, entry.googleEventId);
+      entry.status = "disabled";
+      entry.pendingSince = null;
+      await entry.save();
       return "removed" as const;
     }),
   );
@@ -121,7 +211,6 @@ async function cleanupCalendarEvents(
 
   return { removed, failed };
 }
-
 
 async function updateCalendarEventsForPlatforms(
   user: UserDocument,
@@ -138,6 +227,7 @@ async function updateCalendarEventsForPlatforms(
       const existing = await CalendarEvent.findOne({
         userId: user._id,
         contestId: contest.contestId,
+        status: { $in: ["synced", "updated"] },
       });
       if (!existing) return "skipped" as const;
 
@@ -168,6 +258,7 @@ export async function handlePlatformChanges(
     await syncContestsForPlatforms(platformsAdded);
     const created = await createCalendarEventsForPlatforms(user, platformsAdded);
     result.synced += created.synced;
+    result.removed += created.removed;
     result.failed += created.failed;
   }
 
@@ -219,7 +310,8 @@ export async function syncUserCalendar(userId: string, options?: { fetchContests
   }
 
   if (user.selectedPlatforms.length === 0) {
-    return { synced: 0, updated: 0, failed: 0, removed: 0 };
+    const cleaned = await cleanupCalendarEvents(user);
+    return { synced: 0, updated: 0, failed: cleaned.failed, removed: cleaned.removed };
   }
 
   await syncContestsForPlatforms(user.selectedPlatforms);
@@ -230,7 +322,7 @@ export async function syncUserCalendar(userId: string, options?: { fetchContests
     synced: created.synced,
     updated: 0,
     failed: created.failed + cleaned.failed,
-    removed: cleaned.removed,
+    removed: created.removed + cleaned.removed,
   };
 }
 
