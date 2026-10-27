@@ -1,5 +1,10 @@
 import type { calendar_v3 } from "googleapis";
 
+import {
+  calendarEventId,
+  insertCalendarEventOnce,
+  isMissingCalendarEvent,
+} from "./calendar-event-id";
 import { logger } from "./logger";
 import { getAuthenticatedCalendarClient } from "./auth";
 import type { UserDocument } from "@/models/User";
@@ -46,24 +51,33 @@ export async function createCalendarEvent(
 ) {
   const calendar = await getAuthenticatedCalendarClient(user);
   const body = buildEventBody(contest, user.reminderMinutes);
-
-  const { data } = await calendar.events.insert({
-    calendarId: "primary",
-    requestBody: body,
-  });
-
-  if (!data.id) {
-    throw new Error("Google Calendar did not return an event id");
-  }
+  const eventId = calendarEventId(user._id.toString(), contest.contestId);
+  const id = await insertCalendarEventOnce(
+    eventId,
+    async () => {
+      const { data } = await calendar.events.insert({
+        calendarId: "primary",
+        requestBody: { ...body, id: eventId },
+      });
+      return data.id ?? undefined;
+    },
+    async () => {
+      await calendar.events.update({
+        calendarId: "primary",
+        eventId,
+        requestBody: body,
+      });
+    },
+  );
 
   logger.info({
     event: "calendar_event_created",
     userId: user._id.toString(),
     contestId: contest.contestId,
-    googleEventId: data.id,
+    googleEventId: id,
   });
 
-  return data.id;
+  return id;
 }
 
 export async function updateCalendarEvent(
@@ -97,10 +111,7 @@ export async function deleteCalendarEvent(user: UserDocument, googleEventId: str
       eventId: googleEventId,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "";
-    if (!message.includes("404") && !message.includes("Not Found")) {
-      throw error;
-    }
+    if (!isMissingCalendarEvent(error)) throw error;
   }
 
   logger.info({

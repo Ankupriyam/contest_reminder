@@ -23,6 +23,7 @@ export interface ContestResponse {
 }
 
 export interface UserPreferencesPayload {
+  platformChange?: { platform: Platform; enabled: boolean };
   selectedPlatforms?: Platform[];
   reminderMinutes?: number;
 }
@@ -37,4 +38,5 @@ export interface SyncResult {
 export interface PreferencesUpdateResponse {
   user: UserProfile;
   sync: SyncResult;
+  error?: string;
 }

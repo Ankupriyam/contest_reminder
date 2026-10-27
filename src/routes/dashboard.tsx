@@ -1,7 +1,7 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, Calendar, LogOut, Clock, Bell, Check } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ArrowRight, Calendar, LogOut, Clock, Bell, Check, Volume2 } from "lucide-react";
 import { format } from "date-fns";
 import { VideoBackground } from "@/components/VideoBackground";
 import { ShinyText } from "@/components/ShinyText";
@@ -51,7 +51,6 @@ const REMINDER_OPTIONS = [
   { label: "15 min", value: 15 },
   { label: "30 min", value: 30 },
   { label: "1 hour", value: 60 },
-  { label: "Custom", value: -1 },
 ];
 
 function useCountdown(startTimeIso: string) {
@@ -147,24 +146,38 @@ function Toggle({
   on,
   onChange,
   disabled,
+  label,
 }: {
   on: boolean;
   onChange: (v: boolean) => void;
   disabled?: boolean;
+  label: string;
 }) {
   return (
     <button
+      type="button"
+      role="switch"
+      aria-label={`${label} reminders`}
+      aria-checked={on}
+      aria-busy={disabled}
       onClick={() => onChange(!on)}
       disabled={disabled}
-      className={`relative h-6 w-11 shrink-0 rounded-full transition ${
+      className={`relative flex h-8 w-[76px] shrink-0 items-center rounded-full transition ${
         disabled ? "cursor-wait opacity-60" : ""
       } ${on ? "bg-white" : "bg-white/15"}`}
     >
       <span
-        className={`absolute top-0.5 h-5 w-5 rounded-full bg-black transition-all ${
-          on ? "left-[22px]" : "left-0.5 bg-white"
+        className={`absolute top-1 h-6 w-6 rounded-full transition-all ${
+          on ? "left-[48px] bg-black" : "left-1 bg-white"
         }`}
       />
+      <span
+        className={`w-full text-[10px] font-semibold ${
+          on ? "pr-7 text-black" : "pl-7 text-white/70"
+        }`}
+      >
+        {on ? "ON" : "OFF"}
+      </span>
     </button>
   );
 }
@@ -200,8 +213,12 @@ function Dashboard() {
   const user = userQuery.data;
   const contests = contestsQuery.data?.contests ?? [];
 
-  const [optimisticEnabled, setOptimisticEnabled] = useState<Record<string, boolean> | null>(null);
-  const [syncingPlatform, setSyncingPlatform] = useState<string | null>(null);
+  const preferenceSaveLock = useRef(false);
+  const [savingPreference, setSavingPreference] = useState<string | null>(null);
+  const [preferenceError, setPreferenceError] = useState<string | null>(null);
+  const [customReminderInput, setCustomReminderInput] = useState<string | null>(null);
+  const [testingSound, setTestingSound] = useState(false);
+  const [soundError, setSoundError] = useState<string | null>(null);
 
   const serverEnabled = useMemo(() => {
     const selected = new Set(user?.selectedPlatforms ?? []);
@@ -211,36 +228,99 @@ function Dashboard() {
     >;
   }, [user?.selectedPlatforms]);
 
-  const enabled = optimisticEnabled ?? serverEnabled;
+  const enabled = serverEnabled;
   const reminder = user?.reminderMinutes ?? 15;
+  const customReminderValue =
+    customReminderInput ??
+    (REMINDER_OPTIONS.some((option) => option.value === reminder) ? "" : String(reminder));
   const anyEnabled = Object.values(enabled).some(Boolean);
 
-  const togglePlatform = (platformId: string, value: boolean) => {
+  const savePreferences = async (
+    payload: Parameters<typeof api.updatePreferences>[0],
+    key: string,
+  ) => {
+    if (preferenceSaveLock.current) return;
+
+    preferenceSaveLock.current = true;
+    setSavingPreference(key);
+    setPreferenceError(null);
+    try {
+      const response = await preferencesMutation.mutateAsync(payload);
+      setPreferenceError(response.error ?? null);
+      if (key === "reminder") setCustomReminderInput(null);
+    } catch (error) {
+      setPreferenceError(error instanceof Error ? error.message : "Unable to save preferences.");
+      void queryClient.invalidateQueries({ queryKey: ["user"] });
+    } finally {
+      preferenceSaveLock.current = false;
+      setSavingPreference(null);
+    }
+  };
+
+  const togglePlatform = (platformId: Platform, value: boolean) => {
+    if (preferenceSaveLock.current || !user) return;
     // If turning ON a platform and calendar is not yet connected, redirect to grant calendar permission
-    if (value && !user!.calendarConnected) {
+    if (value && !user.calendarConnected) {
       window.location.href = `/api/auth/connect/calendar?platform=${platformId}`;
       return;
     }
 
-    const nextEnabled = { ...enabled, [platformId]: value };
-    setOptimisticEnabled(nextEnabled);
-    setSyncingPlatform(platformId);
-
-    const selectedPlatforms = PLATFORMS.filter((p) => nextEnabled[p.id]).map((p) => p.id);
-    preferencesMutation.mutate(
-      { selectedPlatforms },
-      {
-        onSettled: () => {
-          setSyncingPlatform(null);
-          setOptimisticEnabled(null);
-        },
-      },
+    void savePreferences(
+      { platformChange: { platform: platformId, enabled: value } },
+      `platform:${platformId}:${value ? "on" : "off"}`,
     );
   };
 
   const saveReminder = (minutes: number) => {
-    if (minutes < 0) return;
-    preferencesMutation.mutate({ reminderMinutes: minutes });
+    if (
+      !Number.isInteger(minutes) ||
+      minutes < 1 ||
+      minutes > 1440 ||
+      preferenceSaveLock.current
+    ) {
+      return;
+    }
+    void savePreferences({ reminderMinutes: minutes }, "reminder");
+  };
+
+  const testSound = async () => {
+    if (testingSound) return;
+
+    setTestingSound(true);
+    setSoundError(null);
+    let context: AudioContext | undefined;
+    try {
+      if (!window.AudioContext) throw new Error("Audio is not supported by this browser.");
+      context = new window.AudioContext();
+      await context.resume();
+      if (context.state === "suspended") throw new Error("Audio playback is blocked.");
+
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      const start = context.currentTime;
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(880, start);
+      oscillator.frequency.setValueAtTime(660, start + 0.22);
+      oscillator.frequency.setValueAtTime(880, start + 0.44);
+      for (const pulse of [0, 0.22, 0.44]) {
+        gain.gain.setValueAtTime(0.0001, start + pulse);
+        gain.gain.linearRampToValueAtTime(0.2, start + pulse + 0.025);
+        gain.gain.setValueAtTime(0.2, start + pulse + 0.13);
+        gain.gain.linearRampToValueAtTime(0.0001, start + pulse + 0.18);
+      }
+      oscillator.connect(gain);
+      gain.connect(context.destination);
+      oscillator.onended = () => {
+        void context?.close().catch(() => {});
+        setTestingSound(false);
+      };
+      oscillator.start(start);
+      oscillator.stop(start + 0.68);
+    } catch {
+      if (context && context.state !== "closed") await context.close().catch(() => {});
+      setSoundError("Sound could not be played. Check your browser audio settings and try again.");
+      setTestingSound(false);
+    }
   };
 
   if (userQuery.isLoading) {
@@ -340,24 +420,34 @@ function Dashboard() {
                     <Toggle
                       on={on}
                       onChange={(v) => togglePlatform(p.id, v)}
-                      disabled={syncingPlatform === p.id}
+                      disabled={savingPreference !== null}
+                      label={p.name}
                     />
                   </div>
                   <h3 className="relative mt-4 text-lg font-medium">{p.name}</h3>
                   <p className="relative mt-2 min-h-[48px] text-xs leading-relaxed text-white/60">
-                    {syncingPlatform === p.id
-                      ? on
-                        ? "Adding future contests to your Google Calendar..."
-                        : "Removing calendar reminders for this platform..."
-                      : on
-                        ? "All future contests will be added to your Google Calendar with your reminder time."
-                        : "Toggle on to start receiving calendar reminders."}
+                    {savingPreference === `platform:${p.id}:on`
+                      ? "Adding future contests to your Google Calendar..."
+                      : savingPreference === `platform:${p.id}:off`
+                        ? "Removing calendar reminders for this platform..."
+                        : on
+                          ? "All future contests will be added to your Google Calendar with your reminder time."
+                          : "Toggle on to start receiving calendar reminders."}
                   </p>
                 </div>
               );
             })}
           </div>
         </section>
+
+        {preferenceError && (
+          <p
+            role="alert"
+            className="mt-4 rounded-xl border border-red-300/20 bg-red-400/10 px-4 py-3 text-sm text-red-200"
+          >
+            {preferenceError}
+          </p>
+        )}
 
         <section className="liquid-glass mt-12 rounded-3xl p-6 md:p-8">
           <div className="flex flex-col gap-6 md:flex-row md:items-start md:justify-between">
@@ -373,25 +463,93 @@ function Dashboard() {
                 Every future contest from your selected platforms will use this reminder time.
               </p>
             </div>
-            <div className="flex flex-wrap gap-2">
-              {REMINDER_OPTIONS.map((o) => {
-                const active = reminder === o.value;
-                return (
-                  <button
-                    key={o.value}
-                    onClick={() => saveReminder(o.value)}
-                    className={`rounded-full border px-4 py-2 text-xs transition ${
-                      active
-                        ? "border-white bg-white text-black"
-                        : "border-white/15 bg-white/5 text-white/80 hover:bg-white/10"
-                    }`}
-                  >
-                    {o.label}
-                  </button>
-                );
-              })}
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-wrap gap-2">
+                {REMINDER_OPTIONS.map((o) => {
+                  const active = reminder === o.value;
+                  return (
+                    <button
+                      type="button"
+                      key={o.value}
+                      onClick={() => saveReminder(o.value)}
+                      disabled={savingPreference !== null}
+                      className={`rounded-full border px-4 py-2 text-xs transition ${
+                        savingPreference !== null
+                          ? "cursor-wait opacity-60"
+                          : active
+                            ? "border-white bg-white text-black"
+                            : "border-white/15 bg-white/5 text-white/80 hover:bg-white/10"
+                      }`}
+                    >
+                      {o.label}
+                    </button>
+                  );
+                })}
+              </div>
+              {savingPreference === "reminder" && (
+                <p className="text-xs text-white/60" role="status">
+                  Saving reminder time...
+                </p>
+              )}
+              <form
+                className="flex flex-wrap items-center gap-2"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const minutes = Number(customReminderValue);
+                  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) {
+                    setPreferenceError("Enter a whole number of minutes from 1 to 1440.");
+                    return;
+                  }
+                  saveReminder(minutes);
+                }}
+              >
+                <label className="sr-only" htmlFor="custom-reminder-minutes">
+                  Custom reminder time in minutes
+                </label>
+                <input
+                  id="custom-reminder-minutes"
+                  type="number"
+                  min={1}
+                  max={1440}
+                  step={1}
+                  required
+                  value={customReminderValue}
+                  onChange={(event) => setCustomReminderInput(event.target.value)}
+                  disabled={savingPreference !== null}
+                  placeholder="Custom minutes"
+                  className="w-36 rounded-full border border-white/15 bg-white/5 px-4 py-2 text-xs text-white placeholder:text-white/45 focus:outline-none focus:ring-1 focus:ring-white/40 disabled:opacity-60"
+                />
+                <button
+                  type="submit"
+                  disabled={savingPreference !== null}
+                  className="rounded-full border border-white/15 bg-white/5 px-4 py-2 text-xs text-white/80 transition hover:bg-white/10 disabled:cursor-wait disabled:opacity-60"
+                >
+                  Save custom time
+                </button>
+              </form>
             </div>
           </div>
+          <div className="mt-6 flex flex-col gap-3 border-t border-white/10 pt-5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="max-w-2xl text-xs leading-relaxed text-white/60">
+              Contest alerts come from Google Calendar. Allow its notifications in your browser or
+              app and enable sound in your device settings. This test checks audio in this open page
+              only.
+            </div>
+            <button
+              type="button"
+              onClick={() => void testSound()}
+              disabled={testingSound}
+              className="inline-flex shrink-0 items-center justify-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs text-white transition hover:bg-white/10 disabled:cursor-wait disabled:opacity-60"
+            >
+              <Volume2 className="h-3.5 w-3.5" />
+              {testingSound ? "Playing..." : "Test sound"}
+            </button>
+          </div>
+          {soundError && (
+            <p role="alert" className="mt-3 text-sm text-red-200">
+              {soundError}
+            </p>
+          )}
         </section>
 
         <section className="mt-12">

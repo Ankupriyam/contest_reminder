@@ -18,7 +18,10 @@ export const Route = createFileRoute("/api/cron")({
             event: "vercel_cron_failed",
             error: error instanceof Error ? error.message : "unknown",
           });
-          return Response.json({ success: false, error: String(error) }, { status: 500 });
+          return Response.json(
+            { success: false, error: "Calendar sync failed" },
+            { status: 500 },
+          );
         }
       },
     },

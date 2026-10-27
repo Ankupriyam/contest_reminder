@@ -1,4 +1,5 @@
 import { connectDb } from "./db";
+import { logger } from "./logger";
 import { checkRateLimit } from "./rate-limit";
 import { getSessionFromRequest } from "./session";
 import { User, type UserDocument } from "@/models/User";
@@ -17,22 +18,21 @@ export async function withApiHandler(
     return Response.json({ error: "Database unavailable" }, { status: 503 });
   }
 
-  const session = await getSessionFromRequest(request);
-  let user: UserDocument | null = null;
-
-  if (session) {
-    user = await User.findById(session.userId);
-  }
-
-  if (options.requireAuth && !user) {
-    return Response.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
   try {
+    const session = await getSessionFromRequest(request);
+    const user = session ? await User.findById(session.userId) : null;
+
+    if (options.requireAuth && !user) {
+      return Response.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
     return await handler(user);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Internal server error";
-    return Response.json({ error: message }, { status: 500 });
+    logger.error({
+      event: "api_handler_failed",
+      error: error instanceof Error ? error.message : "unknown",
+    });
+    return Response.json({ error: "Internal server error" }, { status: 500 });
   }
 }
 
